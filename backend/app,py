@@ -1,0 +1,146 @@
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import requests
+from io import BytesIO
+from PIL import Image
+import boto3
+import uuid
+from fastapi.middleware.cors import CORSMiddleware
+import os
+from run_u2net import run_u2net_inference  # Import the U²Net inference function
+from dotenv import load_dotenv
+load_dotenv()
+
+# Environment vars or hardcode for demo
+S3_BUCKET = os.environ.get("S3_BUCKET", "YOUR_S3_BUCKET_NAME")
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY", "YOUR_AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY", "YOUR_AWS_SECRET_KEY")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+s3 = boto3.client('s3', 
+                  aws_access_key_id=AWS_ACCESS_KEY,
+                  aws_secret_access_key=AWS_SECRET_KEY,
+                  region_name=AWS_REGION)
+
+app = FastAPI(
+    title="Background Removal API",
+    description="API to remove background from product images using U²Net model",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class BoundingBox(BaseModel):
+    x_min: int
+    y_min: int
+    x_max: int
+    y_max: int
+
+class InputData(BaseModel):
+    image_url: str
+    bounding_box: BoundingBox
+
+@app.get("/generate-presigned-url", tags=["Utility"])
+def generate_presigned_url(filename: str):
+    """
+    Generate a pre-signed URL to upload an image file directly to S3.
+    Query Parameter:
+    - filename: the name of the file to upload
+    
+    Returns:
+    - url: the presigned post URL
+    - fields: fields to include in the POST request
+    - public_url: public URL of the file after upload
+    """
+    try:
+        file_extension = filename.split('.')[-1]
+        key = f"uploads/{uuid.uuid4()}.{file_extension}"
+        presigned_post = s3.generate_presigned_post(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Fields={"acl": "public-read", "Content-Type": "image/jpeg"},
+            Conditions=[
+                {"acl": "public-read"},
+                ["content-length-range", 0, 10485760]  # up to ~10MB
+            ],
+            ExpiresIn=3600
+        )
+        public_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
+        return {"url": presigned_post['url'], "fields": presigned_post['fields'], "public_url": public_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/remove-background", tags=["Background Removal"])
+def remove_background(data: InputData):
+    """
+    Remove the background from the product image specified by image_url within the bounding box.
+    
+    Request Body:
+    {
+      "image_url": "<public_image_url>",
+      "bounding_box": {
+        "x_min": <integer>,
+        "y_min": <integer>,
+        "x_max": <integer>,
+        "y_max": <integer>
+      }
+    }
+
+    Returns:
+    {
+      "original_image_url": "<original_image_url>",
+      "processed_image_url": "<background_removed_image_url>"
+    }
+    """
+    try:
+        resp = requests.get(data.image_url)
+        resp.raise_for_status()
+    except:
+        raise HTTPException(status_code=400, detail="Unable to download image from provided URL")
+
+    img = Image.open(BytesIO(resp.content)).convert("RGBA")
+    width, height = img.size
+    bbox = data.bounding_box
+
+    # Validate bounding box
+    if not (0 <= bbox.x_min < bbox.x_max <= width and 0 <= bbox.y_min < bbox.y_max <= height):
+        raise HTTPException(status_code=400, detail="Bounding box exceeds image dimensions")
+
+    # Crop to ROI
+    roi = img.crop((bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max))
+
+    # Run U²Net inference to get mask
+    mask = run_u2net_inference(roi)  # mask is a binary image (mode 'L'), 0=bg, 255=fg
+
+    roi_pixels = roi.load()
+    mask_pixels = mask.load()
+
+    for y in range(roi.height):
+        for x in range(roi.width):
+            if mask_pixels[x, y] == 0:  # background pixel
+                roi_pixels[x, y] = (0, 0, 0, 0)  # Make transparent
+
+    # Save processed image
+    output_buffer = BytesIO()
+    roi.save(output_buffer, format='PNG')
+    output_buffer.seek(0)
+
+    processed_key = f"processed/{uuid.uuid4()}.png"
+    s3.put_object(Bucket=S3_BUCKET, Key=processed_key, Body=output_buffer, ContentType='image/png', ACL='public-read')
+
+    processed_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{processed_key}"
+
+    return {
+        "original_image_url": data.image_url,
+        "processed_image_url": processed_url
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
